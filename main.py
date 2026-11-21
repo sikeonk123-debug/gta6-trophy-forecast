@@ -22,6 +22,25 @@ Model (per case, from that case's read history only):
     therefore assumes one refresh before the target, with the base up about
     fivefold and earners up about 1.3x, and a wide spread.
 
+v2 changes (21 Nov 2026, validated on 17 simulated final-like cases; see
+VALIDATION.md):
+  * Rare-trophy prior: a trophy flat at the display floor (last rate
+    <= 0.05%, logit range ~0 over the fit window) carries no slope signal —
+    its fitted slope is 0 only because nothing has happened yet. It now
+    gets the pooled slope instead of its own zero. In the simulations this
+    fires for ~21 of 55 trophies and is the single biggest win.
+  * Pooled slope over trophies that actually moved only: including the flat
+    trophies' zero slopes dragged the median pooled slope down (~0.59) and
+    understated the trend every trophy follows.
+  * No damping (damp 1.10): v1 damped the slope toward zero for long
+    projections, but the ln(1+h) transform already encodes the
+    deceleration, and a lognormal-ish time-to-earn curve is convex in
+    ln(t) while trophies are still in their steep phase — the fitted trend
+    understates the 4.5-day move, it does not overstate it.
+  * Wider spread: base sigma 0.5 -> 0.6875 per sqrt(day), cap 1.35 -> 2.0
+    (effective ~1.47 logit units at the 4.5-day horizon). v1's 90%
+    intervals covered the truth only 60% of the time on long horizons.
+
 Standard library only, no network, deterministic: the same input bytes
 always produce the same output bytes.
 """
@@ -174,23 +193,40 @@ def trend_slopes(states, n_trophies):
         mx = sum(p[0] for p in pts) / len(pts)
         sxx = sum((p[0] - mx) ** 2 for p in pts)
         se = math.sqrt(s2 / sxx) if sxx > 1e-12 else 1.0
-        own.append((b, se, len(pts)))
-    slopes = [o[0] for o in own if o is not None]
-    slopes.sort()
-    if slopes:
-        g_slope = slopes[len(slopes) // 2]
+        yrange = max(p[1] for p in pts) - min(p[1] for p in pts)
+        own.append((b, se, len(pts), yrange))
+    # Pooled slope over trophies that actually moved: a trophy flat at the
+    # display floor has a fitted slope of 0 only because nothing has
+    # happened yet, so including those zeros would drag the pooled slope
+    # down and understate the trend the flat trophies will follow.
+    moving = [o[0] for o in own if o is not None and o[3] >= 0.05]
+    moving.sort()
+    if moving:
+        g_slope = moving[len(moving) // 2]
     else:
-        g_slope = 0.0
+        slopes = [o[0] for o in own if o is not None]
+        slopes.sort()
+        g_slope = slopes[len(slopes) // 2] if slopes else 0.0
     ses = [o[1] for o in own if o is not None]
     g_se = (sum(ses) / len(ses)) if ses else 1.0
 
     slope_list, se_list = [], []
-    for o in own:
+    last_rates = states[-1]["rates"]
+    for idx, o in enumerate(own):
         if o is None:
             slope_list.append(g_slope)
             se_list.append(g_se)
             continue
-        b, se, n = o
+        b, se, n, yrange = o
+        # A trophy flat at the display floor (last rate <= 0.05%, logit range
+        # ~0 over the window) carries no slope signal at all: its fitted
+        # slope is 0 only because nothing has happened yet, not because it
+        # will not move. Give it the pooled slope instead of its own zero.
+        last_r = last_rates[idx] if idx < len(last_rates) else None
+        if last_r is not None and last_r <= 0.05 and yrange < 0.05:
+            slope_list.append(g_slope)
+            se_list.append(g_se)
+            continue
         w = n / (n + 4.0)  # shrink toward the pooled slope
         b = w * b + (1.0 - w) * g_slope
         b = min(max(b, -2.0), 2.0)
@@ -252,9 +288,9 @@ def forecast_case(case):
     # it approaches its ceiling, so a straight line fitted over the window
     # overstates a move far beyond it. The damping pulls the slope toward
     # zero as the projection grows past the fit's own span.
-    damp = dx_fit / (dx_fit + dx) if dx_fit + dx > 0 else 0.0
+    damp = 1.10
 
-    base_sigma = 0.5 * math.sqrt(horizon_days)
+    base_sigma = 0.6875 * math.sqrt(horizon_days)
     rows = []
     for i, trophy in enumerate(trophies):
         rate = last_rates[i] if i < len(last_rates) else None
@@ -271,7 +307,7 @@ def forecast_case(case):
         sigma = math.sqrt(
             base_sigma ** 2 + (se_list[i] * dx) ** 2 + 0.25 ** 2
         )
-        sigma = min(max(sigma, 0.45), 1.35)
+        sigma = min(max(sigma, 0.45), 2.0)
         rows.append(row_for(trophy["id"], median, sigma))
     return {"trophies": rows}
 
